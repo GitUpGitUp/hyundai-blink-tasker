@@ -1,6 +1,11 @@
 package com.hyundaicompanion.bluelinktasker
 
 import android.content.Intent
+import com.google.gson.GsonBuilder
+import com.google.gson.JsonObject
+import com.google.gson.JsonParseException
+import com.google.gson.JsonPrimitive
+import com.google.gson.Strictness
 import org.json.JSONObject
 
 /**
@@ -23,9 +28,9 @@ data class RemoteStartOptions(
     val seatRearRight: Int? = null,
 ) {
     init {
-        require(durationMinutes in 1..30) { "duration must be 1–30" }
-        require(temperatureF in 60..90) { "temperature must be 60–90 °F" }
-        require(heatedFeatures in 0..3) { "heatedFeatures must be 0–3" }
+        require(durationMinutes in VALID_DURATION) { "duration must be 1–30" }
+        require(temperatureF in VALID_TEMPERATURE) { "temperature must be 60–90 °F" }
+        require(heatedFeatures in VALID_HEATED_FEATURES) { "heatedFeatures must be 0–3" }
     }
 
     fun validatedSeatClimate(): Map<String, Int> {
@@ -38,7 +43,12 @@ data class RemoteStartOptions(
     }
 
     companion object {
+        private val VALID_DURATION = 1..30
+        private val VALID_TEMPERATURE = 60..90
+        private val VALID_HEATED_FEATURES = 0..3
         val VALID_SEAT_STATUS = 0..8
+
+        private val startOptionsJson = GsonBuilder().setStrictness(Strictness.STRICT).create()
 
         private const val API_DRIVER = "drvSeatHeatState"
         private const val API_PASSENGER = "astSeatHeatState"
@@ -47,11 +57,11 @@ data class RemoteStartOptions(
 
         fun fromSecurePrefs(prefs: SecurePrefs): RemoteStartOptions =
             RemoteStartOptions(
-                durationMinutes = prefs.rsDurationMinutes.coerceIn(1, 30),
-                temperatureF = prefs.rsTempF.coerceIn(60, 90),
+                durationMinutes = prefs.rsDurationMinutes.coerceIn(VALID_DURATION),
+                temperatureF = prefs.rsTempF.coerceIn(VALID_TEMPERATURE),
                 climateOn = prefs.rsClimateOn,
                 defrost = prefs.rsDefrost,
-                heatedFeatures = prefs.rsHeatedFeatures.coerceIn(0, 3),
+                heatedFeatures = prefs.rsHeatedFeatures.coerceIn(VALID_HEATED_FEATURES),
                 seatDriver = prefs.rsSeatDriver.takeIf { it in VALID_SEAT_STATUS },
                 seatPassenger = prefs.rsSeatPassenger.takeIf { it in VALID_SEAT_STATUS },
                 seatRearLeft = prefs.rsSeatRearLeft.takeIf { it in VALID_SEAT_STATUS },
@@ -59,17 +69,19 @@ data class RemoteStartOptions(
             )
 
         /**
-         * Tasker / intent extras override prefs when present.
-         * Booleans: "true"/"1" / "false"/"0".
-         * Optional seats: 0–8, or omit extra.
+         * The JSON extra overrides saved defaults field by field. Legacy extras are used
+         * when the JSON extra is absent.
          */
         fun mergeFromIntent(intent: Intent, prefs: SecurePrefs): RemoteStartOptions {
             var o = fromSecurePrefs(prefs)
+            if (intent.hasExtra(EXTRA_START_OPTIONS)) {
+                return o.mergeStartJson(intent.getStringExtra(EXTRA_START_OPTIONS))
+            }
             if (intent.hasExtra(EXTRA_START_DURATION)) {
-                o = o.copy(durationMinutes = intent.getIntExtra(EXTRA_START_DURATION, o.durationMinutes).coerceIn(1, 30))
+                o = o.copy(durationMinutes = intent.getIntExtra(EXTRA_START_DURATION, o.durationMinutes).coerceIn(VALID_DURATION))
             }
             if (intent.hasExtra(EXTRA_START_TEMP)) {
-                o = o.copy(temperatureF = intent.getIntExtra(EXTRA_START_TEMP, o.temperatureF).coerceIn(60, 90))
+                o = o.copy(temperatureF = intent.getIntExtra(EXTRA_START_TEMP, o.temperatureF).coerceIn(VALID_TEMPERATURE))
             }
             if (intent.hasExtra(EXTRA_START_CLIMATE)) {
                 o = o.copy(climateOn = readBoolExtra(intent, EXTRA_START_CLIMATE, o.climateOn))
@@ -78,7 +90,7 @@ data class RemoteStartOptions(
                 o = o.copy(defrost = readBoolExtra(intent, EXTRA_START_DEFROST, o.defrost))
             }
             if (intent.hasExtra(EXTRA_START_HEATED)) {
-                o = o.copy(heatedFeatures = intent.getIntExtra(EXTRA_START_HEATED, o.heatedFeatures).coerceIn(0, 3))
+                o = o.copy(heatedFeatures = intent.getIntExtra(EXTRA_START_HEATED, o.heatedFeatures).coerceIn(VALID_HEATED_FEATURES))
             }
             if (intent.hasExtra(EXTRA_START_SEAT_JSON)) {
                 o = o.mergeSeatJson(intent.getStringExtra(EXTRA_START_SEAT_JSON))
@@ -97,6 +109,35 @@ data class RemoteStartOptions(
                 }
             }
             return o
+        }
+
+        private fun RemoteStartOptions.mergeStartJson(json: String?): RemoteStartOptions {
+            if (json.isNullOrBlank()) return this
+
+            val fields = try {
+                startOptionsJson.fromJson(json, JsonObject::class.java) ?: return this
+            } catch (_: JsonParseException) {
+                return this
+            }
+
+            fun validInt(key: String, range: IntRange): Int? =
+                (fields[key] as? JsonPrimitive)?.takeIf { it.isNumber }
+                    ?.asString?.toIntOrNull()?.takeIf { it in range }
+
+            fun boolean(key: String): Boolean? =
+                (fields[key] as? JsonPrimitive)?.takeIf { it.isBoolean }?.asBoolean
+
+            return copy(
+                durationMinutes = validInt("duration", VALID_DURATION) ?: durationMinutes,
+                temperatureF = validInt("temp", VALID_TEMPERATURE) ?: temperatureF,
+                climateOn = boolean("climate") ?: climateOn,
+                defrost = boolean("defrost") ?: defrost,
+                heatedFeatures = validInt("heated", VALID_HEATED_FEATURES) ?: heatedFeatures,
+                seatDriver = validInt("driverSeat", VALID_SEAT_STATUS) ?: seatDriver,
+                seatPassenger = validInt("passengerSeat", VALID_SEAT_STATUS) ?: seatPassenger,
+                seatRearLeft = validInt("rearLeftSeat", VALID_SEAT_STATUS) ?: seatRearLeft,
+                seatRearRight = validInt("rearRightSeat", VALID_SEAT_STATUS) ?: seatRearRight,
+            )
         }
 
         private fun readBoolExtra(intent: Intent, key: String, fallback: Boolean): Boolean {
@@ -136,6 +177,7 @@ data class RemoteStartOptions(
             return optInt(key)
         }
 
+        const val EXTRA_START_OPTIONS = "start_options"
         const val EXTRA_START_DURATION = "start_duration"
         const val EXTRA_START_TEMP = "start_temp"
         const val EXTRA_START_CLIMATE = "start_climate"
